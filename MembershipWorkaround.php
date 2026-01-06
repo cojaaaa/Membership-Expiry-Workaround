@@ -6,6 +6,7 @@
  * Author URI: https://github.com/cojaaaa
  */
 
+
 if (!defined('ABSPATH')) exit;
 
 class UR_Membership_Automation {
@@ -37,8 +38,10 @@ class UR_Membership_Automation {
         add_action('plugins_loaded', [$this, 'bootstrap_ur_emails'], 20);
         add_action('init', [$this, 'schedule_daily']);
         add_action(self::CRON_HOOK, [$this, 'run_daily']);
+
         add_action('admin_menu', [$this, 'admin_menu']);
         add_action('admin_post_ur_membership_automation_run_now', [$this, 'admin_run_now']);
+        add_action('admin_post_ur_membership_automation_send_test_email', [$this, 'admin_send_test_email']);
     }
 
     /**
@@ -172,7 +175,7 @@ class UR_Membership_Automation {
                 }
             }
 
-            // Send expiry email (optional but enabled here)
+            // Send expiry email
             $user = get_user_by('id', $user_id);
             if ($user && !empty($user->user_email)) {
                 $subject = 'Your membership has expired';
@@ -186,12 +189,11 @@ class UR_Membership_Automation {
     }
 
     // =========================
-    // DB access (UPDATED TABLE)
+    // DB access (CONFIRMED TABLE)
     // =========================
 
     private function subscriptions_table(): string {
         global $wpdb;
-        // Your confirmed table name:
         return $wpdb->prefix . 'ur_membership_subscriptions';
     }
 
@@ -200,7 +202,7 @@ class UR_Membership_Automation {
         $table = $this->subscriptions_table();
 
         $sql = $wpdb->prepare(
-            "SELECT member_id, next_billing_date
+            "SELECT member_id, next_billing_date, status
              FROM {$table}
              WHERE DATE(next_billing_date) = %s
                AND status = %s",
@@ -217,7 +219,7 @@ class UR_Membership_Automation {
         $table = $this->subscriptions_table();
 
         $sql = $wpdb->prepare(
-            "SELECT member_id, next_billing_date
+            "SELECT member_id, next_billing_date, status
              FROM {$table}
              WHERE DATE(next_billing_date) < %s
                AND status = %s",
@@ -229,6 +231,43 @@ class UR_Membership_Automation {
         return is_array($rows) ? $rows : [];
     }
 
+    /**
+     * Fetch a subscription record for a given user ID.
+     * We try "active" first, then any status if none found.
+     */
+    private function get_subscription_for_user(int $user_id): ?array {
+        global $wpdb;
+        $table = $this->subscriptions_table();
+
+        // Try active first
+        $sql_active = $wpdb->prepare(
+            "SELECT *
+             FROM {$table}
+             WHERE member_id = %d
+             ORDER BY id DESC
+             LIMIT 1",
+            $user_id
+        );
+
+        // Some schemas may not have "id". If this fails, fallback to no ORDER BY.
+        $row = $wpdb->get_row($sql_active, ARRAY_A);
+
+        if (is_array($row) && !empty($row)) {
+            return $row;
+        }
+
+        $sql_fallback = $wpdb->prepare(
+            "SELECT *
+             FROM {$table}
+             WHERE member_id = %d
+             LIMIT 1",
+            $user_id
+        );
+        $row2 = $wpdb->get_row($sql_fallback, ARRAY_A);
+
+        return (is_array($row2) && !empty($row2)) ? $row2 : null;
+    }
+
     // =========================
     // Email templates
     // =========================
@@ -236,18 +275,47 @@ class UR_Membership_Automation {
     private function render_reminder_email(WP_User $user, int $days_before, string $next_billing_date): string {
         $site = wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES);
         return "Hello {$user->display_name},\n\n"
-            . "This is a friendly reminder that your membership will renew on: {$next_billing_date}\n"
-            . "That is in {$days_before} day(s).\n\n"
-            . "If you have any questions, please contact support.\n\n"
+            . "This is a test/automation reminder email.\n"
+            . "Next billing/expiry date recorded in the system: {$next_billing_date}\n"
+            . "Reminder offset: {$days_before} day(s)\n\n"
             . "— {$site}\n";
     }
 
     private function render_expired_email(WP_User $user, string $next_billing_date): string {
         $site = wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES);
         return "Hello {$user->display_name},\n\n"
-            . "Your membership has expired (billing date was: {$next_billing_date}).\n"
-            . "To regain access, please renew your subscription.\n\n"
+            . "Your membership is marked as expired (billing date was: {$next_billing_date}).\n\n"
             . "— {$site}\n";
+    }
+
+    private function render_test_email(WP_User $user, array $sub): string {
+        $site = wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES);
+        $lines = [];
+
+        $lines[] = "Hello {$user->display_name},";
+        $lines[] = "";
+        $lines[] = "This is a TEST email from UR Membership Automation.";
+        $lines[] = "We verified that your user has a subscription record.";
+        $lines[] = "";
+
+        // Print some useful fields if present
+        $interesting = [
+            'member_id', 'status', 'plan_id', 'membership_id',
+            'start_date', 'created_at', 'expires_at', 'expiry_date',
+            'next_billing_date', 'end_date'
+        ];
+
+        $lines[] = "Subscription fields:";
+        foreach ($interesting as $k) {
+            if (array_key_exists($k, $sub) && $sub[$k] !== null && $sub[$k] !== '') {
+                $lines[] = "- {$k}: {$sub[$k]}";
+            }
+        }
+
+        $lines[] = "";
+        $lines[] = "— {$site}";
+
+        return implode("\n", $lines);
     }
 
     // =========================
@@ -314,7 +382,7 @@ class UR_Membership_Automation {
     }
 
     // =========================
-    // Admin UI
+    // Admin UI + Actions
     // =========================
 
     public function admin_menu(): void {
@@ -337,23 +405,90 @@ class UR_Membership_Automation {
         exit;
     }
 
+    public function admin_send_test_email(): void {
+        if (!current_user_can('manage_options')) wp_die('Forbidden');
+        check_admin_referer('ur_membership_automation_send_test_email');
+
+        $user_id = isset($_POST['ur_test_user_id']) ? (int) $_POST['ur_test_user_id'] : 0;
+
+        if ($user_id <= 0) {
+            wp_safe_redirect(admin_url('tools.php?page=ur-membership-automation&test=bad_user'));
+            exit;
+        }
+
+        $user = get_user_by('id', $user_id);
+        if (!$user || empty($user->user_email)) {
+            $this->log('test_skip', $user_id, '', 'User not found or no email');
+            wp_safe_redirect(admin_url('tools.php?page=ur-membership-automation&test=no_user'));
+            exit;
+        }
+
+        $sub = $this->get_subscription_for_user($user_id);
+        if (!$sub) {
+            $this->log('test_skip', $user_id, '', 'No subscription found in table');
+            wp_safe_redirect(admin_url('tools.php?page=ur-membership-automation&test=no_sub'));
+            exit;
+        }
+
+        $subject = '[TEST] Membership automation email';
+        $message = $this->render_test_email($user, $sub);
+
+        $sent = wp_mail($user->user_email, $subject, $message);
+
+        $this->log($sent ? 'test_sent' : 'test_fail', $user_id, '', $sent ? 'Test email sent' : 'wp_mail failed');
+
+        wp_safe_redirect(admin_url('tools.php?page=ur-membership-automation&test=' . ($sent ? 'sent' : 'fail')));
+        exit;
+    }
+
     public function admin_page(): void {
         if (!current_user_can('manage_options')) return;
 
-        $ran = isset($_GET['ran']) ? (int)$_GET['ran'] : 0;
-        $nonce_url = wp_nonce_url(
+        $ran  = isset($_GET['ran']) ? (int)$_GET['ran'] : 0;
+        $test = isset($_GET['test']) ? sanitize_text_field(wp_unslash($_GET['test'])) : '';
+
+        $run_now_url = wp_nonce_url(
             admin_url('admin-post.php?action=ur_membership_automation_run_now'),
             'ur_membership_automation_run_now'
         );
+
+        $send_test_action = admin_url('admin-post.php?action=ur_membership_automation_send_test_email');
+        $send_test_nonce  = wp_create_nonce('ur_membership_automation_send_test_email');
 
         echo '<div class="wrap">';
         echo '<h1>UR Membership Automation</h1>';
 
         if ($ran) {
-            echo '<div class="notice notice-success"><p>Ran successfully.</p></div>';
+            echo '<div class="notice notice-success"><p>Automation ran successfully.</p></div>';
         }
 
-        echo '<p><a class="button button-primary" href="' . esc_url($nonce_url) . '">Run now</a></p>';
+        if ($test) {
+            $msg = match ($test) {
+                'sent'    => 'Test email sent.',
+                'fail'    => 'Test email FAILED (wp_mail returned false).',
+                'no_sub'  => 'No subscription found for that user ID.',
+                'no_user' => 'User not found or user has no email.',
+                'bad_user'=> 'Invalid user ID.',
+                default   => 'Test action finished.',
+            };
+            $cls = in_array($test, ['sent'], true) ? 'success' : 'warning';
+            echo '<div class="notice notice-' . esc_attr($cls) . '"><p>' . esc_html($msg) . '</p></div>';
+        }
+
+        echo '<p><a class="button button-primary" href="' . esc_url($run_now_url) . '">Run now</a></p>';
+
+        echo '<h2>Send test email by User ID</h2>';
+        echo '<form method="post" action="' . esc_url($send_test_action) . '">';
+        echo '<input type="hidden" name="_wpnonce" value="' . esc_attr($send_test_nonce) . '" />';
+        echo '<table class="form-table" role="presentation"><tbody>';
+        echo '<tr>';
+        echo '<th scope="row"><label for="ur_test_user_id">User ID</label></th>';
+        echo '<td><input name="ur_test_user_id" id="ur_test_user_id" type="number" min="1" class="regular-text" required />';
+        echo '<p class="description">Enter a WordPress user ID. The plugin will check if a subscription exists in <code>' . esc_html($this->subscriptions_table()) . '</code> and send a test email to the user.</p></td>';
+        echo '</tr>';
+        echo '</tbody></table>';
+        echo '<p><button type="submit" class="button">Send test email</button></p>';
+        echo '</form>';
 
         echo '<h2>Status</h2>';
         echo '<ul>';
