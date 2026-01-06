@@ -239,34 +239,46 @@ class UR_Membership_Automation {
         global $wpdb;
         $table = $this->subscriptions_table();
 
-        // Try active first
-        $sql_active = $wpdb->prepare(
-            "SELECT *
-             FROM {$table}
-             WHERE member_id = %d
-             ORDER BY id DESC
-             LIMIT 1",
+        // Detect which column stores WP user id
+        $columns = $wpdb->get_col("SHOW COLUMNS FROM {$table}", 0);
+        if (!is_array($columns) || empty($columns)) {
+            $this->log('test_fail', $user_id, '', 'Could not read table columns');
+            return null;
+        }
+
+        // Common candidates across plugins
+        $candidates = ['member_id', 'user_id', 'customer_id', 'wp_user_id', 'user'];
+        $id_col = null;
+        foreach ($candidates as $c) {
+            if (in_array($c, $columns, true)) {
+                $id_col = $c;
+                break;
+            }
+        }
+
+        if (!$id_col) {
+            $this->log('test_fail', $user_id, '', 'No user id column found. Columns: ' . implode(',', $columns));
+            return null;
+        }
+
+        // Try ORDER BY id if exists, else fallback
+        $order_by = in_array('id', $columns, true) ? 'ORDER BY id DESC' : '';
+        $sql = $wpdb->prepare(
+            "SELECT * FROM {$table} WHERE {$id_col} = %d {$order_by} LIMIT 1",
             $user_id
         );
 
-        // Some schemas may not have "id". If this fails, fallback to no ORDER BY.
-        $row = $wpdb->get_row($sql_active, ARRAY_A);
-
+        $row = $wpdb->get_row($sql, ARRAY_A);
         if (is_array($row) && !empty($row)) {
+            // Helpful log so you can see which column matched
+            $this->log('test_debug', $user_id, '', "Matched using column={$id_col}");
             return $row;
         }
 
-        $sql_fallback = $wpdb->prepare(
-            "SELECT *
-             FROM {$table}
-             WHERE member_id = %d
-             LIMIT 1",
-            $user_id
-        );
-        $row2 = $wpdb->get_row($sql_fallback, ARRAY_A);
-
-        return (is_array($row2) && !empty($row2)) ? $row2 : null;
+        $this->log('test_debug', $user_id, '', "No rows matched using column={$id_col}");
+        return null;
     }
+
 
     // =========================
     // Email templates
