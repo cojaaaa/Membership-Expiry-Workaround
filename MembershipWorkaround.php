@@ -1,11 +1,10 @@
 <?php
 /**
  * Plugin Name: Workaround za istek - NE DIRAJ!!!!!!!
- * Description: 
+ * Description:
  * Author: cojv
  * Author URI: https://github.com/cojaaaa
  */
-
 
 if (!defined('ABSPATH')) exit;
 
@@ -16,22 +15,12 @@ class UR_Membership_Automation {
 
     /**
      * CONFIG
-     * - Reminders will be sent when DATE(next_billing_date) == today + offset
-     * - Example: [7, 1] means send 7 days before and 1 day before
      */
     private array $reminder_offsets_days = [7, 1];
 
-    /**
-     * On expiry (DATE(next_billing_date) < today) we mark usermeta as expired
-     * Optional role removal is OFF by default.
-     */
     private bool $remove_role_on_expiry = false;
     private string $role_to_remove = 'subscriber';
 
-    /**
-     * Also call UR built-in reminder hook (uses UR templates/settings) — ON by default.
-     * It will only send if option user_registration_membership_renewal_reminder_user_email is enabled.
-     */
     private bool $also_call_ur_builtin_reminder_hook = true;
 
     public function __construct() {
@@ -44,10 +33,6 @@ class UR_Membership_Automation {
         add_action('admin_post_ur_membership_automation_send_test_email', [$this, 'admin_send_test_email']);
     }
 
-    /**
-     * Fix for your setup: EmailSettings exists but isn't instantiated automatically,
-     * so the hook urm_daily_membership_renewal_check has no callbacks.
-     */
     public function bootstrap_ur_emails(): void {
         if (class_exists('\WPEverest\URMembership\Emails\EmailSettings')) {
             static $booted = false;
@@ -60,7 +45,7 @@ class UR_Membership_Automation {
 
     public function schedule_daily(): void {
         if (!wp_next_scheduled(self::CRON_HOOK)) {
-            wp_schedule_event(time() + 300, 'daily', self::CRON_HOOK); // +5 minutes then daily
+            wp_schedule_event(time() + 300, 'daily', self::CRON_HOOK);
         }
         $this->maybe_create_log_table();
     }
@@ -70,10 +55,16 @@ class UR_Membership_Automation {
             $this->log('lock', 0, '', 'Skipped: already running');
             return;
         }
+
         $this->lock();
 
         try {
             $this->maybe_create_log_table();
+
+            // ✅ NEW: clear old logs so they don't repeat
+            $this->clear_logs();
+
+            $this->log('start', 0, '', 'Run started');
 
             // 1) Call UR built-in reminder logic (optional)
             if ($this->also_call_ur_builtin_reminder_hook) {
@@ -88,6 +79,8 @@ class UR_Membership_Automation {
 
             // 3) Expire memberships past due
             $this->expire_past_due_memberships();
+
+            $this->log('finish', 0, '', 'Run finished');
 
         } catch (\Throwable $e) {
             $this->log('error', 0, '', 'Exception: ' . $e->getMessage());
@@ -111,9 +104,15 @@ class UR_Membership_Automation {
         }
 
         foreach ($subs as $sub) {
-            $user_id = (int)$sub['member_id'];
-            $next_billing_date = (string)$sub['next_billing_date'];
-            $next_norm = substr($next_billing_date, 0, 10);
+            // ✅ NEW: robust user id extraction (not only member_id)
+            $user_id = $this->get_user_id_from_subscription_row($sub);
+            if ($user_id <= 0) {
+                $this->log('reminder_skip', 0, $target, 'Could not detect user id column/value in subscription row');
+                continue;
+            }
+
+            $next_billing_date = (string)($sub['next_billing_date'] ?? '');
+            $next_norm = $next_billing_date ? substr($next_billing_date, 0, 10) : $target;
 
             // Dedup per offset
             $meta_key = "ur_reminder_sent_{$days_before}d_for_date";
@@ -131,11 +130,12 @@ class UR_Membership_Automation {
             $subject = sprintf('Your membership renews in %d day(s)', $days_before);
             $message = $this->render_reminder_email($user, $days_before, $next_billing_date);
 
-            $sent = wp_mail($user->user_email, $subject, $message);
+            // ✅ NEW: sends to user + BCC admin
+            $sent = $this->send_mail_with_admin_bcc($user->user_email, $subject, $message);
 
             if ($sent) {
                 update_user_meta($user_id, $meta_key, $next_norm);
-                $this->log('reminder_sent', $user_id, $next_norm, "Sent offset={$days_before} to {$user->user_email}");
+                $this->log('reminder_sent', $user_id, $next_norm, "Sent offset={$days_before} to {$user->user_email} (+admin BCC)");
             } else {
                 $this->log('reminder_fail', $user_id, $next_norm, "wp_mail failed offset={$days_before}");
             }
@@ -152,9 +152,15 @@ class UR_Membership_Automation {
         }
 
         foreach ($subs as $sub) {
-            $user_id = (int)$sub['member_id'];
-            $next_billing_date = (string)$sub['next_billing_date'];
-            $next_norm = substr($next_billing_date, 0, 10);
+            // ✅ NEW: robust user id extraction
+            $user_id = $this->get_user_id_from_subscription_row($sub);
+            if ($user_id <= 0) {
+                $this->log('expired_skip', 0, $today, 'Could not detect user id column/value in subscription row');
+                continue;
+            }
+
+            $next_billing_date = (string)($sub['next_billing_date'] ?? '');
+            $next_norm = $next_billing_date ? substr($next_billing_date, 0, 10) : $today;
 
             // Dedup expiry once per billing date
             $meta_key = 'ur_membership_expired_for_date';
@@ -180,8 +186,11 @@ class UR_Membership_Automation {
             if ($user && !empty($user->user_email)) {
                 $subject = 'Your membership has expired';
                 $message = $this->render_expired_email($user, $next_billing_date);
-                $sent = wp_mail($user->user_email, $subject, $message);
-                $this->log($sent ? 'expired_sent' : 'expired_fail', $user_id, $next_norm, 'Expired + email attempted');
+
+                // ✅ NEW: sends to user + BCC admin
+                $sent = $this->send_mail_with_admin_bcc($user->user_email, $subject, $message);
+
+                $this->log($sent ? 'expired_sent' : 'expired_fail', $user_id, $next_norm, 'Expired + email attempted (+admin BCC)');
             } else {
                 $this->log('expired_marked', $user_id, $next_norm, 'Expired marked (no email)');
             }
@@ -201,8 +210,9 @@ class UR_Membership_Automation {
         global $wpdb;
         $table = $this->subscriptions_table();
 
+        // keep SELECT * so we can detect id columns in row
         $sql = $wpdb->prepare(
-            "SELECT member_id, next_billing_date, status
+            "SELECT *
              FROM {$table}
              WHERE DATE(next_billing_date) = %s
                AND status = %s",
@@ -219,7 +229,7 @@ class UR_Membership_Automation {
         $table = $this->subscriptions_table();
 
         $sql = $wpdb->prepare(
-            "SELECT member_id, next_billing_date, status
+            "SELECT *
              FROM {$table}
              WHERE DATE(next_billing_date) < %s
                AND status = %s",
@@ -233,20 +243,18 @@ class UR_Membership_Automation {
 
     /**
      * Fetch a subscription record for a given user ID.
-     * We try "active" first, then any status if none found.
+     * Auto-detect ID column.
      */
     private function get_subscription_for_user(int $user_id): ?array {
         global $wpdb;
         $table = $this->subscriptions_table();
 
-        // Detect which column stores WP user id
         $columns = $wpdb->get_col("SHOW COLUMNS FROM {$table}", 0);
         if (!is_array($columns) || empty($columns)) {
             $this->log('test_fail', $user_id, '', 'Could not read table columns');
             return null;
         }
 
-        // Common candidates across plugins
         $candidates = ['member_id', 'user_id', 'customer_id', 'wp_user_id', 'user'];
         $id_col = null;
         foreach ($candidates as $c) {
@@ -261,7 +269,6 @@ class UR_Membership_Automation {
             return null;
         }
 
-        // Try ORDER BY id if exists, else fallback
         $order_by = in_array('id', $columns, true) ? 'ORDER BY id DESC' : '';
         $sql = $wpdb->prepare(
             "SELECT * FROM {$table} WHERE {$id_col} = %d {$order_by} LIMIT 1",
@@ -270,7 +277,6 @@ class UR_Membership_Automation {
 
         $row = $wpdb->get_row($sql, ARRAY_A);
         if (is_array($row) && !empty($row)) {
-            // Helpful log so you can see which column matched
             $this->log('test_debug', $user_id, '', "Matched using column={$id_col}");
             return $row;
         }
@@ -279,6 +285,17 @@ class UR_Membership_Automation {
         return null;
     }
 
+    /**
+     * ✅ NEW: extract user id from a subscription row (no assumption it's member_id)
+     */
+    private function get_user_id_from_subscription_row(array $sub): int {
+        foreach (['member_id', 'user_id', 'wp_user_id', 'customer_id', 'user'] as $k) {
+            if (isset($sub[$k]) && is_numeric($sub[$k]) && (int)$sub[$k] > 0) {
+                return (int)$sub[$k];
+            }
+        }
+        return 0;
+    }
 
     // =========================
     // Email templates
@@ -286,48 +303,78 @@ class UR_Membership_Automation {
 
     private function render_reminder_email(WP_User $user, int $days_before, string $next_billing_date): string {
         $site = wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES);
-        return "Hello {$user->display_name},\n\n"
-            . "This is a test/automation reminder email.\n"
-            . "Next billing/expiry date recorded in the system: {$next_billing_date}\n"
-            . "Reminder offset: {$days_before} day(s)\n\n"
-            . "— {$site}\n";
+
+        return "Poštovani {$user->display_name},\n\n"
+            . "Ovim putem Vas obaveštavamo da Vaše članstvo ističe za {$days_before} "
+            . ($days_before === 1 ? 'dan' : 'dana') . ".\n\n"
+            . "Datum isteka članstva: {$next_billing_date}\n\n"
+            . "Ukoliko želite da produžite članstvo, molimo Vas da to učinite pre isteka.\n\n"
+            . "Srdačan pozdrav,\n"
+            . "{$site}\n";
     }
 
     private function render_expired_email(WP_User $user, string $next_billing_date): string {
         $site = wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES);
-        return "Hello {$user->display_name},\n\n"
-            . "Your membership is marked as expired (billing date was: {$next_billing_date}).\n\n"
-            . "— {$site}\n";
+
+        return "Poštovani {$user->display_name},\n\n"
+            . "Obaveštavamo Vas da je Vaše članstvo isteklo.\n\n"
+            . "Datum isteka članstva: {$next_billing_date}\n\n"
+            . "Ukoliko želite da ponovo aktivirate članstvo, "
+            . "molimo Vas da se prijavite na svoj nalog i izvršite obnovu.\n\n"
+            . "Srdačan pozdrav,\n"
+            . "{$site}\n";
     }
+
 
     private function render_test_email(WP_User $user, array $sub): string {
         $site = wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES);
+
         $lines = [];
-
-        $lines[] = "Hello {$user->display_name},";
+        $lines[] = "Poštovani {$user->display_name},";
         $lines[] = "";
-        $lines[] = "This is a TEST email from UR Membership Automation.";
-        $lines[] = "We verified that your user has a subscription record.";
+        $lines[] = "Ovo je TEST mejl za proveru sistema obaveštavanja o članstvu.";
+        $lines[] = "Sistem je uspešno pronašao aktivnu subskripciju za Vaš nalog.";
         $lines[] = "";
 
-        // Print some useful fields if present
-        $interesting = [
-            'member_id', 'status', 'plan_id', 'membership_id',
-            'start_date', 'created_at', 'expires_at', 'expiry_date',
-            'next_billing_date', 'end_date'
+        $lines[] = "Detalji subskripcije:";
+        $fields = [
+            'status' => 'Status',
+            'next_billing_date' => 'Datum isteka',
+            'start_date' => 'Datum početka',
+            'created_at' => 'Kreirano',
+            'membership_id' => 'ID članstva',
+            'plan_id' => 'ID plana'
         ];
 
-        $lines[] = "Subscription fields:";
-        foreach ($interesting as $k) {
-            if (array_key_exists($k, $sub) && $sub[$k] !== null && $sub[$k] !== '') {
-                $lines[] = "- {$k}: {$sub[$k]}";
+        foreach ($fields as $key => $label) {
+            if (!empty($sub[$key])) {
+                $lines[] = "- {$label}: {$sub[$key]}";
             }
         }
 
         $lines[] = "";
-        $lines[] = "— {$site}";
+        $lines[] = "Ovaj mejl je informativnog karaktera.";
+        $lines[] = "";
+        $lines[] = "Srdačan pozdrav,";
+        $lines[] = "{$site}";
 
         return implode("\n", $lines);
+    }
+
+
+    // =========================
+    // ✅ NEW: Mail helper (user + admin BCC)
+    // =========================
+
+    private function send_mail_with_admin_bcc(string $to, string $subject, string $message): bool {
+        $admin_email = get_option('admin_email');
+        $headers = [];
+
+        if (!empty($admin_email) && is_email($admin_email)) {
+            $headers[] = 'Bcc: ' . $admin_email;
+        }
+
+        return wp_mail($to, $subject, $message, $headers);
     }
 
     // =========================
@@ -359,6 +406,19 @@ class UR_Membership_Automation {
         ) {$charset_collate};";
 
         dbDelta($sql);
+    }
+
+    /**
+     * ✅ NEW: clear logs so they don't repeat (TRUNCATE = fastest)
+     */
+    private function clear_logs(): void {
+        global $wpdb;
+        $table = $wpdb->prefix . self::LOG_TABLE_SUFFIX;
+
+        $exists = ($wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $table)) === $table);
+        if (!$exists) return;
+
+        $wpdb->query("TRUNCATE TABLE {$table}");
     }
 
     private function log(string $action, int $user_id, string $ref_date, string $message): void {
@@ -445,9 +505,10 @@ class UR_Membership_Automation {
         $subject = '[TEST] Membership automation email';
         $message = $this->render_test_email($user, $sub);
 
-        $sent = wp_mail($user->user_email, $subject, $message);
+        // ✅ NEW: send to user + admin BCC
+        $sent = $this->send_mail_with_admin_bcc($user->user_email, $subject, $message);
 
-        $this->log($sent ? 'test_sent' : 'test_fail', $user_id, '', $sent ? 'Test email sent' : 'wp_mail failed');
+        $this->log($sent ? 'test_sent' : 'test_fail', $user_id, '', $sent ? 'Test email sent (+admin BCC)' : 'wp_mail failed');
 
         wp_safe_redirect(admin_url('tools.php?page=ur-membership-automation&test=' . ($sent ? 'sent' : 'fail')));
         exit;
@@ -471,12 +532,12 @@ class UR_Membership_Automation {
         echo '<h1>UR Membership Automation</h1>';
 
         if ($ran) {
-            echo '<div class="notice notice-success"><p>Automation ran successfully.</p></div>';
+            echo '<div class="notice notice-success"><p>Automation ran successfully (logs cleared, new logs added).</p></div>';
         }
 
         if ($test) {
             $msg = match ($test) {
-                'sent'    => 'Test email sent.',
+                'sent'    => 'Test email sent (admin also received via BCC).',
                 'fail'    => 'Test email FAILED (wp_mail returned false).',
                 'no_sub'  => 'No subscription found for that user ID.',
                 'no_user' => 'User not found or user has no email.',
@@ -496,7 +557,7 @@ class UR_Membership_Automation {
         echo '<tr>';
         echo '<th scope="row"><label for="ur_test_user_id">User ID</label></th>';
         echo '<td><input name="ur_test_user_id" id="ur_test_user_id" type="number" min="1" class="regular-text" required />';
-        echo '<p class="description">Enter a WordPress user ID. The plugin will check if a subscription exists in <code>' . esc_html($this->subscriptions_table()) . '</code> and send a test email to the user.</p></td>';
+        echo '<p class="description">Sends test email to user and BCC admin. Also prints useful subscription fields in email.</p></td>';
         echo '</tr>';
         echo '</tbody></table>';
         echo '<p><button type="submit" class="button">Send test email</button></p>';
@@ -507,9 +568,10 @@ class UR_Membership_Automation {
         echo '<li>UR hook registered (urm_daily_membership_renewal_check): <strong>' . (has_action('urm_daily_membership_renewal_check') ? 'YES' : 'NO') . '</strong></li>';
         echo '<li>Next run: <strong>' . esc_html($this->next_run_human()) . '</strong></li>';
         echo '<li>Subscriptions table: <code>' . esc_html($this->subscriptions_table()) . '</code></li>';
+        echo '<li>Admin email (BCC): <code>' . esc_html(get_option('admin_email')) . '</code></li>';
         echo '</ul>';
 
-        echo '<h2>Recent logs</h2>';
+        echo '<h2>Logs (last run only)</h2>';
         $this->render_logs_table();
 
         echo '</div>';
@@ -531,7 +593,7 @@ class UR_Membership_Automation {
             return;
         }
 
-        $rows = $wpdb->get_results("SELECT * FROM {$table} ORDER BY id DESC LIMIT 50", ARRAY_A);
+        $rows = $wpdb->get_results("SELECT * FROM {$table} ORDER BY id DESC LIMIT 200", ARRAY_A);
         if (empty($rows)) {
             echo '<p>No logs yet.</p>';
             return;
@@ -548,7 +610,7 @@ class UR_Membership_Automation {
             echo '<td>' . esc_html($r['action']) . '</td>';
             echo '<td>' . $user_label . '</td>';
             echo '<td>' . esc_html($r['ref_date']) . '</td>';
-            echo '<td>' . esc_html(wp_trim_words((string)$r['message'], 20)) . '</td>';
+            echo '<td>' . esc_html($r['message']) . '</td>';
             echo '</tr>';
         }
         echo '</tbody></table>';
