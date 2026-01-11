@@ -28,6 +28,8 @@ class UR_Membership_Automation {
         add_action('init', [$this, 'schedule_daily']);
         add_action(self::CRON_HOOK, [$this, 'run_daily']);
 
+        add_action('admin_post_ur_membership_debug_7day_window',[$this, 'admin_debug_7day_window']);
+
         add_action('admin_menu', [$this, 'admin_menu']);
         add_action('admin_post_ur_membership_automation_run_now', [$this, 'admin_run_now']);
         add_action('admin_post_ur_membership_automation_send_test_email', [$this, 'admin_send_test_email']);
@@ -50,6 +52,99 @@ class UR_Membership_Automation {
         $this->maybe_create_log_table();
     }
 
+    public function admin_debug_7day_window(): void {
+        if (!current_user_can('manage_options')) {
+            wp_die('Forbidden');
+        }
+        check_admin_referer('ur_membership_debug_7day_window');
+
+        $this->debug_users_who_should_get_7day_notice_next_7_days();
+
+        wp_safe_redirect(
+            admin_url('tools.php?page=ur-membership-automation&debug7=1')
+        );
+        exit;
+    }
+
+
+    private function debug_users_who_should_get_7day_notice_next_7_days(): void {
+        global $wpdb;
+
+        $days_before = 7;
+
+        $tz = wp_timezone();
+        $today = new DateTime('today', $tz);
+
+        $from = (clone $today)->modify("+{$days_before} day")->format('Y-m-d');          // today+7
+        $to   = (clone $today)->modify("+".($days_before + 6)." day")->format('Y-m-d'); // today+13
+
+        $table = $this->subscriptions_table();
+
+        $subs = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT *
+                FROM {$table}
+                WHERE DATE(next_billing_date) BETWEEN %s AND %s
+                AND status = %s
+                ORDER BY next_billing_date ASC",
+                $from,
+                $to,
+                'active'
+            ),
+            ARRAY_A
+        );
+
+        if (empty($subs)) {
+            error_log("URM 7DAY WINDOW: Niko nema isteke u periodu {$from} → {$to} (status=active).");
+            return;
+        }
+
+        error_log("URM 7DAY WINDOW: Expiry range {$from} → {$to}. Kandidata (active) = " . count($subs));
+
+        $eligible = 0;
+        $already_sent = 0;
+        $skipped = 0;
+
+        foreach ($subs as $sub) {
+            $user_id = $this->get_user_id_from_subscription_row($sub);
+            $next_billing_date = (string)($sub['next_billing_date'] ?? '');
+
+            if ($user_id <= 0) {
+                $skipped++;
+                error_log("URM 7DAY WINDOW: SKIP (no user_id detected). next_billing_date={$next_billing_date}");
+                continue;
+            }
+
+            $next_norm = $next_billing_date ? substr($next_billing_date, 0, 10) : '';
+            if ($next_norm === '') {
+                $skipped++;
+                error_log("URM 7DAY WINDOW: SKIP (empty next_billing_date) user_id={$user_id}");
+                continue;
+            }
+
+            $notice_day = (new DateTime($next_norm, $tz))->modify("-{$days_before} day")->format('Y-m-d');
+
+            $meta_key = "ur_reminder_sent_{$days_before}d_for_date";
+            $already  = (string) get_user_meta($user_id, $meta_key, true);
+
+            $user = get_user_by('id', (int)$user_id);
+            $email = ($user && !empty($user->user_email)) ? $user->user_email : '(email not found)';
+            $login = ($user && !empty($user->user_login)) ? $user->user_login : '(login not found)';
+
+            if ($already === $next_norm) {
+                $already_sent++;
+                error_log("URM 7DAY WINDOW: NOT ELIGIBLE (already sent) user_id={$user_id}, login={$login}, email={$email}, expiry={$next_billing_date}, 7day_notice_on={$notice_day}, meta={$meta_key}={$already}");
+                continue;
+            }
+
+            $eligible++;
+            error_log("URM 7DAY WINDOW: ✅ ELIGIBLE user_id={$user_id}, login={$login}, email={$email}, expiry={$next_billing_date}, 7day_notice_on={$notice_day}, meta={$meta_key}={$already}");
+        }
+
+        error_log("URM 7DAY WINDOW: Summary eligible={$eligible}, already_sent={$already_sent}, skipped={$skipped}, total=" . count($subs));
+    }
+
+    
     public function run_daily(): void {
         if ($this->is_locked()) {
             $this->log('lock', 0, '', 'Skipped: already running');
@@ -219,7 +314,6 @@ class UR_Membership_Automation {
             $date_ymd,
             $status
         );
-
         $rows = $wpdb->get_results($sql, ARRAY_A);
         return is_array($rows) ? $rows : [];
     }
@@ -274,7 +368,6 @@ class UR_Membership_Automation {
             "SELECT * FROM {$table} WHERE {$id_col} = %d {$order_by} LIMIT 1",
             $user_id
         );
-
         $row = $wpdb->get_row($sql, ARRAY_A);
         if (is_array($row) && !empty($row)) {
             $this->log('test_debug', $user_id, '', "Matched using column={$id_col}");
@@ -300,7 +393,6 @@ class UR_Membership_Automation {
     // =========================
     // Email templates
     // =========================
-
     private function render_reminder_email(WP_User $user, int $days_before, string $next_billing_date): string {
         $site = wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES);
 
@@ -547,9 +639,15 @@ class UR_Membership_Automation {
             $cls = in_array($test, ['sent'], true) ? 'success' : 'warning';
             echo '<div class="notice notice-' . esc_attr($cls) . '"><p>' . esc_html($msg) . '</p></div>';
         }
-
+        $debug7_url = wp_nonce_url(
+            admin_url('admin-post.php?action=ur_membership_debug_7day_window'),
+            'ur_membership_debug_7day_window'
+        );
         echo '<p><a class="button button-primary" href="' . esc_url($run_now_url) . '">Run now</a></p>';
-
+        echo '<p><a class="button" href="' . esc_url($debug7_url) . '">🔍 Debug: ko dobija 7-day notice (narednih 7 dana)</a></p>';
+        if (isset($_GET['debug7'])){
+            echo '<div class="notice notice-info"><p>Debug za 7-day notice je izvršen. Proveri <code>error_log</code>.</p></div>';
+        }
         echo '<h2>Send test email by User ID</h2>';
         echo '<form method="post" action="' . esc_url($send_test_action) . '">';
         echo '<input type="hidden" name="_wpnonce" value="' . esc_attr($send_test_nonce) . '" />';
